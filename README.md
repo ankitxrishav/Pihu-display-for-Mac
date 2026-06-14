@@ -10,6 +10,14 @@ For details on the internals and system pipelines, read [ARCHITECTURE.md](ARCHIT
 
 ---
 
+## Demo Video
+
+Below is a side-by-side recording showing the macOS screen (left) and the Android device screen (right) establishing a connection and streaming at low latency:
+
+https://github.com/ankitxrishav/Pihu-display-for-Mac/raw/main/demo.mp4
+
+---
+
 ## Setup Guide
 
 Follow these steps to prepare your Mac and Android device for building and running the project.

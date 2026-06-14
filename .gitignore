@@ -13,3 +13,7 @@ android-client/local.properties
 
 # Pulled screenshots
 /*.png
+
+# Logs and test captures
+*.log
+test_mac.mp4
