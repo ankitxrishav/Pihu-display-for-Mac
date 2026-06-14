@@ -197,7 +197,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
             
-            codec.configure(format, surface, null, 0)
+            try {
+                codec.configure(format, surface, null, 0)
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaCodec low-latency configuration failed, retrying with standard parameters", e)
+                val safeFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080)
+                codec.configure(safeFormat, surface, null, 0)
+            }
             codec.start()
             
             decoder = codec
