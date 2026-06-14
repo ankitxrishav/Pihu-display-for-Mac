@@ -70,6 +70,10 @@ class TCPClient {
                 var sendBufSize: Int32 = 1024 * 1024
                 setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendBufSize, socklen_t(MemoryLayout<Int32>.size))
                 
+                // Prevent SIGPIPE on macOS socket writes
+                var noSigPipe: Int32 = 1
+                setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+                
                 var addr = sockaddr_in()
                 addr.sin_len = __uint8_t(MemoryLayout<sockaddr_in>.size)
                 addr.sin_family = sa_family_t(AF_INET)

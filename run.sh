@@ -40,6 +40,7 @@ echo -e "\n${YELLOW}[5/5] Installing & launching Android Client app...${NC}"
 /opt/homebrew/bin/adb install -r android-client/app/build/outputs/apk/debug/app-debug.apk
 /opt/homebrew/bin/adb shell am start -n com.pihu.display/.MainActivity
 echo -e "${GREEN}Android Client app launched on device!${NC}"
+sleep 2
 
 # Launch macOS Host App
 echo -e "\n${YELLOW}=== Starting macOS Host stream... ===${NC}"

@@ -287,7 +287,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 Log.d(TAG, "Starting ServerSocket on port $PORT...")
                 val sSock = ServerSocket()
                 sSock.reuseAddress = true
-                sSock.bind(InetSocketAddress(PORT))
+                sSock.bind(InetSocketAddress("127.0.0.1", PORT))
                 serverSocket = sSock
 
                 Log.d(TAG, "Waiting for host connection (adb forward)...")
