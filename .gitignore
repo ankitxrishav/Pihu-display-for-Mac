@@ -1,0 +1,15 @@
+# macOS build files
+mac-host/.build/
+.DS_Store
+
+# Android build files
+android-client/.gradle/
+android-client/build/
+android-client/app/build/
+android-client/local.properties
+.idea/
+*.apk
+*.flat
+
+# Pulled screenshots
+/*.png
