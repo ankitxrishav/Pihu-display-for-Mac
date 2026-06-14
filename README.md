@@ -10,6 +10,12 @@ For details on the internals and system pipelines, read [ARCHITECTURE.md](ARCHIT
 
 ---
 
+## Demo
+
+Watch the demo video: [Pihu Display Demo (Google Drive)](https://drive.google.com/file/d/1aMLDORvqV8By20J1PEIvwi7CIceSUwD7/view?usp=sharing)
+
+---
+
 ## Setup Guide
 
 Follow these steps to prepare your Mac and Android device for building and running the project.
