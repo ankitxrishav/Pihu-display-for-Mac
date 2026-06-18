@@ -1,5 +1,7 @@
 # Pihu Display for Mac
 
+<a href="https://www.producthunt.com/products/pihu-display?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-pihu-display" target="_blank" rel="noopener noreferrer"><img alt="Pihu Display - Turn your Android into a wired second monitor for macOS. | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1172355&amp;theme=light&amp;t=1781789732295"></a>
+
 Pihu Display is a high-performance system tool that lets you use an Android device as a secondary monitor for your Mac over USB. It achieves sub-40ms latency by using hardware video encoding/decoding and USB socket tunneling.
 
 This project consists of two parts:
