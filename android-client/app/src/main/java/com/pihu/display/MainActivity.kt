@@ -13,6 +13,8 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -30,6 +32,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private val PORT = 27183
 
     private var surfaceView: SurfaceView? = null
+    private var lastVideoWidth = 0
+    private var lastVideoHeight = 0
     private var decoder: MediaCodec? = null
     private var isDecoderConfigured = false
     private var surface: Surface? = null
@@ -48,8 +52,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         
         val container = FrameLayout(this)
         container.setBackgroundColor(Color.parseColor("#121214"))
+        container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (lastVideoWidth > 0 && lastVideoHeight > 0) {
+                adjustSurfaceViewAspectRatio(lastVideoWidth, lastVideoHeight)
+            }
+        }
 
-        surfaceView = SurfaceView(this)
+        surfaceView = SurfaceView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
+            )
+        }
         surfaceView?.holder?.addCallback(this)
         container.addView(surfaceView)
 
@@ -145,6 +160,76 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         overlayView = welcomeLayout
     }
 
+    override fun onResume() {
+        super.onResume()
+        hideSystemUI()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            hideSystemUI()
+        }
+    }
+
+    private fun hideSystemUI() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            val controller = window.insetsController
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+    }
+
+    private fun adjustSurfaceViewAspectRatio(videoWidth: Int, videoHeight: Int) {
+        lastVideoWidth = videoWidth
+        lastVideoHeight = videoHeight
+        
+        runOnUiThread {
+            val view = surfaceView ?: return@runOnUiThread
+            val container = view.parent as? View ?: return@runOnUiThread
+            val containerWidth = container.width
+            val containerHeight = container.height
+            if (containerWidth <= 0 || containerHeight <= 0 || videoWidth <= 0 || videoHeight <= 0) return@runOnUiThread
+
+            val videoAspect = videoWidth.toFloat() / videoHeight.toFloat()
+            val containerAspect = containerWidth.toFloat() / containerHeight.toFloat()
+
+            val targetWidth: Int
+            val targetHeight: Int
+
+            if (videoAspect > containerAspect) {
+                // Video is wider than screen aspect ratio: letterbox
+                targetWidth = containerWidth
+                targetHeight = (containerWidth / videoAspect).toInt()
+            } else {
+                // Video is taller than screen aspect ratio: pillarbox
+                targetHeight = containerHeight
+                targetWidth = (containerHeight * videoAspect).toInt()
+            }
+
+            val lp = view.layoutParams as FrameLayout.LayoutParams
+            lp.width = targetWidth
+            lp.height = targetHeight
+            lp.gravity = Gravity.CENTER
+            view.layoutParams = lp
+            Log.d(TAG, "Adjusted SurfaceView size to ${targetWidth}x${targetHeight} for video ${videoWidth}x${videoHeight}")
+        }
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {
         Log.d(TAG, "Surface created")
         surface = holder.surface
@@ -219,6 +304,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         val outputBufferIndex = myCodec.dequeueOutputBuffer(bufferInfo, 10000) // 10ms timeout
                         if (outputBufferIndex >= 0) {
                             myCodec.releaseOutputBuffer(outputBufferIndex, true)
+                        } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            val newFormat = myCodec.outputFormat
+                            val hasCrop = newFormat.containsKey("crop-left") && newFormat.containsKey("crop-right") &&
+                                          newFormat.containsKey("crop-top") && newFormat.containsKey("crop-bottom")
+                            val videoWidth = if (hasCrop) {
+                                newFormat.getInteger("crop-right") - newFormat.getInteger("crop-left") + 1
+                            } else {
+                                newFormat.getInteger(MediaFormat.KEY_WIDTH)
+                            }
+                            val videoHeight = if (hasCrop) {
+                                newFormat.getInteger("crop-bottom") - newFormat.getInteger("crop-top") + 1
+                            } else {
+                                newFormat.getInteger(MediaFormat.KEY_HEIGHT)
+                            }
+                            Log.d(TAG, "Decoder output format changed: ${videoWidth}x${videoHeight}")
+                            adjustSurfaceViewAspectRatio(videoWidth, videoHeight)
                         }
                     } catch (e: InterruptedException) {
                         break
@@ -305,8 +406,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 socket = sock
                 socket.tcpNoDelay = true
                 socket.receiveBufferSize = 1024 * 1024
+                
+                // Get physical screen size
+                val displayMetrics = resources.displayMetrics
+                val screenWidth = displayMetrics.widthPixels
+                val screenHeight = displayMetrics.heightPixels
+                Log.d(TAG, "Host connected successfully! Screen size: ${screenWidth}x${screenHeight}")
+
+                // Send screen size to host immediately
+                try {
+                    val outputStream = socket.getOutputStream()
+                    val sizeBuffer = java.nio.ByteBuffer.allocate(8)
+                    sizeBuffer.putInt(screenWidth)
+                    sizeBuffer.putInt(screenHeight)
+                    outputStream.write(sizeBuffer.array())
+                    outputStream.flush()
+                    Log.d(TAG, "Sent screen size to host: ${screenWidth}x${screenHeight}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to send screen size to host", e)
+                }
+
                 inputStream = socket.getInputStream()
-                Log.d(TAG, "Host connected successfully!")
 
                 runOnUiThread {
                     Toast.makeText(this@MainActivity, "Connected to host display!", Toast.LENGTH_SHORT).show()

@@ -88,6 +88,58 @@ class TCPClient {
                 
                 if connectResult >= 0 {
                     print("[Client] Connected to Android server successfully!")
+                    
+                    // Read screen dimensions (8 bytes: 4 bytes width, 4 bytes height, big-endian)
+                    var buffer = [UInt8](repeating: 0, count: 8)
+                    var totalRead = 0
+                    var timedOut = false
+                    
+                    // Set a temporary read timeout of 1 second for the handshake
+                    var timeout = timeval()
+                    timeout.tv_sec = 1
+                    timeout.tv_usec = 0
+                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+                    
+                    while totalRead < 8 {
+                        var result = 0
+                        buffer.withUnsafeMutableBytes { rawBufferPointer in
+                            if let baseAddress = rawBufferPointer.baseAddress {
+                                let destPointer = baseAddress.assumingMemoryBound(to: UInt8.self) + totalRead
+                                result = recv(sock, destPointer, 8 - totalRead, 0)
+                            }
+                        }
+                        if result <= 0 {
+                            print("[Client] Failed to read screen size from Android client. Falling back to default.")
+                            timedOut = true
+                            break
+                        }
+                        totalRead += result
+                    }
+                    
+                    // Reset timeout to infinite / default after handshake
+                    var noTimeout = timeval()
+                    noTimeout.tv_sec = 0
+                    noTimeout.tv_usec = 0
+                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, socklen_t(MemoryLayout<timeval>.size))
+                    
+                    if !timedOut {
+                        // Decode big-endian integers
+                        let wBytes = Array(buffer[0..<4])
+                        let hBytes = Array(buffer[4..<8])
+                        let width = wBytes.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+                        let height = hBytes.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+                        print("[Client] Received screen size from Android client: \(width)x\(height)")
+                        
+                        // Notify host application of the new dimensions
+                        DispatchQueue.main.async {
+                            NotificationCenter.default.post(
+                                name: Notification.Name("PihuAndroidScreenSizeReceived"),
+                                object: nil,
+                                userInfo: ["width": width, "height": height]
+                            )
+                        }
+                    }
+                    
                     self.clientSocket = sock
                     self.isConnected = true
                 } else {

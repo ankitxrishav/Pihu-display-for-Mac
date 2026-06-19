@@ -7,6 +7,8 @@ import CGVirtualDisplayPrivate
 class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate {
     private let encoder: Encoder
     private var isEncoderInitialized = false
+    private var currentWidth: Int32 = 0
+    private var currentHeight: Int32 = 0
     
     init(encoder: Encoder) {
         self.encoder = encoder
@@ -20,13 +22,23 @@ class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate {
         // 1. Get pixel buffer
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let width = Int32(CVPixelBufferGetWidth(pixelBuffer))
+        let height = Int32(CVPixelBufferGetHeight(pixelBuffer))
         
         // 2. Initialize or reinitialize encoder if dimensions changed
-        if !isEncoderInitialized {
-            if encoder.setupSession(width: Int32(width), height: Int32(height)) {
+        if !isEncoderInitialized || width != currentWidth || height != currentHeight {
+            print("[Stream] Screen dimensions changed or encoder not initialized. New size: \(width)x\(height)")
+            if isEncoderInitialized {
+                encoder.teardownSession()
+                isEncoderInitialized = false
+            }
+            if encoder.setupSession(width: width, height: height) {
                 isEncoderInitialized = true
+                currentWidth = width
+                currentHeight = height
+            } else {
+                print("[Stream] Failed to setup encoder session for \(width)x\(height)")
+                return
             }
         }
         
@@ -60,8 +72,8 @@ let descriptor = CGVirtualDisplayDescriptor()
 descriptor.queue = DispatchQueue(label: "com.pihu.display.virtual", qos: .userInteractive)
 descriptor.name = "Pihu Display"
 descriptor.sizeInMillimeters = CGSize(width: 330, height: 206) // 15" physical layout
-descriptor.maxPixelsWide = 1920
-descriptor.maxPixelsHigh = 1080
+descriptor.maxPixelsWide = 2560
+descriptor.maxPixelsHigh = 1600
 descriptor.vendorID = 0x1234
 descriptor.productID = 0x5678
 descriptor.serialNum = 1
@@ -178,5 +190,93 @@ sigintSource.setEventHandler {
 }
 signal(SIGINT, SIG_IGN)
 sigintSource.resume()
+
+// 7. Dynamic Resolution Updater based on client aspect ratio
+func updateVirtualDisplayResolution(phoneWidth: UInt32, phoneHeight: UInt32) {
+    guard let virtualDisplay = activeVirtualDisplay else { return }
+    
+    // Calculate aspect ratio
+    let aspect = Double(phoneWidth) / Double(phoneHeight)
+    
+    // Target display height is capped at 1080 for coding/decoding efficiency,
+    // keeping the exact aspect ratio of the phone screen.
+    let targetHeight: Double = 1080.0
+    let targetWidth = targetHeight * aspect
+    
+    let w = Int32(round(targetWidth))
+    // Make sure width is even, as H.264 encoding requires even dimensions!
+    let finalWidth = (w % 2 == 0) ? w : w - 1
+    let finalHeight = Int32(targetHeight)
+    
+    print("[PihuDisplayHost] Updating virtual display resolution to match phone aspect ratio: \(finalWidth)x\(finalHeight) (Phone: \(phoneWidth)x\(phoneHeight))")
+    
+    let settings = CGVirtualDisplaySettings()
+    guard let mode = CGVirtualDisplayMode(width: UInt32(finalWidth), height: UInt32(finalHeight), refreshRate: 60) else {
+        print("[PihuDisplayHost] Error: Failed to create CGVirtualDisplayMode for \(finalWidth)x\(finalHeight)")
+        return
+    }
+    settings.modes = [mode]
+    settings.hiDPI = 1
+    
+    if virtualDisplay.applySettings(settings) {
+        print("[PihuDisplayHost] Successfully applied new display resolution settings.")
+        
+        // Restart capture stream to pick up the new resolution
+        Task {
+            if let stream = activeStream {
+                do {
+                    try await stream.stopCapture()
+                    print("[PihuDisplayHost] Stopped old capture stream.")
+                } catch {
+                    print("[PihuDisplayHost] Error stopping capture stream: \(error)")
+                }
+            }
+            
+            // Re-create the stream configuration with new dimensions
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                guard let display = content.displays.first(where: { $0.displayID == virtualDisplay.displayID }) else {
+                    print("[PihuDisplayHost] Error: Virtual display not found for recreation.")
+                    return
+                }
+                
+                print("[PihuDisplayHost] Re-capturing virtual display: \(display.width)x\(display.height)")
+                
+                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let config = SCStreamConfiguration()
+                config.width = display.width
+                config.height = display.height
+                config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+                config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                config.queueDepth = 3
+                
+                let handler = StreamOutputHandler(encoder: encoder)
+                let stream = SCStream(filter: filter, configuration: config, delegate: handler)
+                try stream.addStreamOutput(handler, type: SCStreamOutputType.screen, sampleHandlerQueue: DispatchQueue(label: "com.pihu.display.capture"))
+                
+                try await stream.startCapture()
+                activeStream = stream
+                activeStreamOutputHandler = handler
+                print("[PihuDisplayHost] Screen capture restarted successfully at \(display.width)x\(display.height)!")
+            } catch {
+                print("[PihuDisplayHost] Error restarting screen capture: \(error)")
+            }
+        }
+    } else {
+        print("[PihuDisplayHost] WARNING: Failed to apply settings to virtual display.")
+    }
+}
+
+NotificationCenter.default.addObserver(
+    forName: Notification.Name("PihuAndroidScreenSizeReceived"),
+    object: nil,
+    queue: .main
+) { notification in
+    guard let userInfo = notification.userInfo,
+          let phoneWidth = userInfo["width"] as? UInt32,
+          let phoneHeight = userInfo["height"] as? UInt32 else { return }
+    
+    updateVirtualDisplayResolution(phoneWidth: phoneWidth, phoneHeight: phoneHeight)
+}
 
 semaphore.wait()
