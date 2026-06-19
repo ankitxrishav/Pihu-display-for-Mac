@@ -72,8 +72,8 @@ let descriptor = CGVirtualDisplayDescriptor()
 descriptor.queue = DispatchQueue(label: "com.pihu.display.virtual", qos: .userInteractive)
 descriptor.name = "Pihu Display"
 descriptor.sizeInMillimeters = CGSize(width: 330, height: 206) // 15" physical layout
-descriptor.maxPixelsWide = 2560
-descriptor.maxPixelsHigh = 1600
+descriptor.maxPixelsWide = 1920
+descriptor.maxPixelsHigh = 1080
 descriptor.vendorID = 0x1234
 descriptor.productID = 0x5678
 descriptor.serialNum = 1
@@ -198,15 +198,30 @@ func updateVirtualDisplayResolution(phoneWidth: UInt32, phoneHeight: UInt32) {
     // Calculate aspect ratio
     let aspect = Double(phoneWidth) / Double(phoneHeight)
     
-    // Target display height is capped at 1080 for coding/decoding efficiency,
-    // keeping the exact aspect ratio of the phone screen.
-    let targetHeight: Double = 1080.0
-    let targetWidth = targetHeight * aspect
+    // Fit the phone aspect ratio within the 1920x1080 maximum bounds
+    let finalWidth: Int32
+    let finalHeight: Int32
     
-    let w = Int32(round(targetWidth))
-    // Make sure width is even, as H.264 encoding requires even dimensions!
-    let finalWidth = (w % 2 == 0) ? w : w - 1
-    let finalHeight = Int32(targetHeight)
+    let maxW: Double = 1920.0
+    let maxH: Double = 1080.0
+    
+    if aspect > (maxW / maxH) {
+        // Phone is wider than 16:9
+        let w = maxW
+        let h = w / aspect
+        let wInt = Int32(round(w))
+        let hInt = Int32(round(h))
+        finalWidth = (wInt % 2 == 0) ? wInt : wInt - 1
+        finalHeight = (hInt % 2 == 0) ? hInt : hInt - 1
+    } else {
+        // Phone is taller than 16:9 (e.g. 16:10 or 4:3)
+        let h = maxH
+        let w = h * aspect
+        let wInt = Int32(round(w))
+        let hInt = Int32(round(h))
+        finalWidth = (wInt % 2 == 0) ? wInt : wInt - 1
+        finalHeight = (hInt % 2 == 0) ? hInt : hInt - 1
+    }
     
     print("[PihuDisplayHost] Updating virtual display resolution to match phone aspect ratio: \(finalWidth)x\(finalHeight) (Phone: \(phoneWidth)x\(phoneHeight))")
     
