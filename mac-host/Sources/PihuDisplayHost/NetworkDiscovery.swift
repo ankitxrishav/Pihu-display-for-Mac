@@ -185,16 +185,33 @@ class NetworkDiscovery {
 class BonjourResolver: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     private let browser = NetServiceBrowser()
     private var resolvedIP: String?
-    private let semaphore = DispatchSemaphore(value: 0)
     private var activeService: NetService?
+    private var isDone = false
     
     func resolve(timeout: TimeInterval = 4.0) -> String? {
-        browser.delegate = self
-        browser.searchForServices(ofType: "_pihu._tcp.", inDomain: "local.")
+        let thread = Thread { [weak self] in
+            guard let self = self else { return }
+            
+            self.browser.delegate = self
+            self.browser.searchForServices(ofType: "_pihu._tcp.", inDomain: "local.")
+            
+            let limitDate = Date(timeIntervalSinceNow: timeout)
+            while !self.isDone && RunLoop.current.run(mode: .default, before: limitDate) {
+                if Date() > limitDate {
+                    break
+                }
+            }
+            
+            self.browser.stop()
+            self.activeService?.stop()
+        }
         
-        _ = semaphore.wait(timeout: .now() + timeout)
-        browser.stop()
-        activeService?.stop()
+        thread.start()
+        
+        while !thread.isFinished {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        
         return resolvedIP
     }
     
@@ -218,7 +235,7 @@ class BonjourResolver: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
                     let ipString = String(cString: ipBuffer)
                     if !ipString.isEmpty {
                         resolvedIP = ipString
-                        semaphore.signal()
+                        isDone = true
                     }
                 }
             }
@@ -226,10 +243,10 @@ class BonjourResolver: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     }
     
     func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String : NSNumber]) {
-        semaphore.signal()
+        isDone = true
     }
     
     func netService(_ sender: NetService, didNotResolve errorDict: [String : NSNumber]) {
-        semaphore.signal()
+        isDone = true
     }
 }
