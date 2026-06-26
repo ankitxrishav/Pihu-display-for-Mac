@@ -17,3 +17,6 @@ android-client/local.properties
 # Logs and test captures
 *.log
 test_mac.mp4
+
+# Packaging distributions
+dist/

@@ -25,6 +25,12 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.InetSocketAddress
 import kotlin.concurrent.thread
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
+import android.content.Context
+import org.json.JSONObject
+import java.util.UUID
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
@@ -246,9 +252,77 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surface = null
     }
 
+    private var nsdManager: NsdManager? = null
+    private var registrationListener: NsdManager.RegistrationListener? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    private fun registerNsdService() {
+        try {
+            // 1. Acquire Multicast Lock
+            val wifiManager = getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifiManager.createMulticastLock("PihuMulticastLock").apply {
+                setReferenceCounted(true)
+                acquire()
+            }
+            Log.d(TAG, "Multicast lock acquired")
+            
+            // 2. Register NSD Service
+            nsdManager = (getSystemService(Context.NSD_SERVICE) as NsdManager).apply {
+                val serviceInfo = NsdServiceInfo().apply {
+                    serviceName = "PihuDisplay-${android.os.Build.MODEL.replace(" ", "_")}"
+                    serviceType = "_pihu._tcp."
+                    port = PORT
+                }
+                
+                registrationListener = object : NsdManager.RegistrationListener {
+                    override fun onServiceRegistered(registeredInfo: NsdServiceInfo) {
+                        Log.d(TAG, "NSD Service registered: ${registeredInfo.serviceName}")
+                    }
+                    
+                    override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                        Log.e(TAG, "NSD Registration failed: $errorCode")
+                    }
+                    
+                    override fun onServiceUnregistered(registeredInfo: NsdServiceInfo) {
+                        Log.d(TAG, "NSD Service unregistered")
+                    }
+                    
+                    override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                        Log.e(TAG, "NSD Unregistration failed: $errorCode")
+                    }
+                }
+                
+                registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register NSD service", e)
+        }
+    }
+    
+    private fun unregisterNsdService() {
+        try {
+            registrationListener?.let {
+                nsdManager?.unregisterService(it)
+            }
+            registrationListener = null
+            nsdManager = null
+            
+            multicastLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                }
+            }
+            multicastLock = null
+            Log.d(TAG, "NSD service unregistered and multicast lock released")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering NSD service", e)
+        }
+    }
+
     private fun startStreaming() {
         if (isRunning) return
         isRunning = true
+        registerNsdService()
 
         rxThread = thread(name = "PihuRxThread", priority = Thread.MAX_PRIORITY) {
             runRxLoop()
@@ -257,6 +331,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun stopStreaming() {
         isRunning = false
+        unregisterNsdService()
         rxThread?.interrupt()
         rxThread = null
         
@@ -367,12 +442,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return true
     }
 
+    private fun sendLengthPrefixedData(outputStream: java.io.OutputStream, data: ByteArray): Boolean {
+        return try {
+            val lengthBuffer = java.nio.ByteBuffer.allocate(4).putInt(data.size)
+            outputStream.write(lengthBuffer.array())
+            outputStream.write(data)
+            outputStream.flush()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error writing length-prefixed data", e)
+            false
+        }
+    }
+    
+    private fun readLengthPrefixedData(inputStream: InputStream): ByteArray? {
+        val lengthBuffer = ByteArray(4)
+        if (!readExactly(inputStream, lengthBuffer, 4)) return null
+        val length = ((lengthBuffer[0].toInt() and 0xFF) shl 24) or
+                     ((lengthBuffer[1].toInt() and 0xFF) shl 16) or
+                     ((lengthBuffer[2].toInt() and 0xFF) shl 8) or
+                     (lengthBuffer[3].toInt() and 0xFF)
+        if (length <= 0 || length > 10 * 1024 * 1024) return null
+        val dataBuffer = ByteArray(length)
+        if (!readExactly(inputStream, dataBuffer, length)) return null
+        return dataBuffer
+    }
+
     private fun runRxLoop() {
         val lengthBuffer = ByteArray(4)
         var payloadBuffer = ByteArray(1024 * 1024) // 1MB reusable buffer
         var serverSocket: ServerSocket? = null
-        var socket: Socket? = null
-        var inputStream: InputStream? = null
 
         while (isRunning) {
             val s = surface
@@ -386,22 +485,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 initDecoder(s)
             }
 
+            // Ensure ServerSocket is active and bound
+            if (serverSocket == null || serverSocket.isClosed) {
+                try {
+                    Log.d(TAG, "Starting ServerSocket on port $PORT...")
+                    runOnUiThread {
+                        statusText?.text = "Waiting for host connection..."
+                        overlayView?.visibility = View.VISIBLE
+                    }
+                    val sSock = ServerSocket()
+                    sSock.reuseAddress = true
+                    sSock.bind(InetSocketAddress(PORT))
+                    serverSocket = sSock
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start ServerSocket: ${e.message}")
+                    try { Thread.sleep(1000) } catch (ex: InterruptedException) {}
+                    continue
+                }
+            }
+
+            var socket: Socket? = null
+            var inputStream: InputStream? = null
             try {
-                runOnUiThread {
-                    statusText?.text = "Waiting for host connection..."
-                    overlayView?.visibility = View.VISIBLE
-                }
-                Log.d(TAG, "Starting ServerSocket on port $PORT...")
-                val sSock = ServerSocket()
-                sSock.reuseAddress = true
-                sSock.bind(InetSocketAddress("127.0.0.1", PORT))
-                serverSocket = sSock
-
-                Log.d(TAG, "Waiting for host connection (adb forward)...")
-                runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Waiting for host connection...", Toast.LENGTH_SHORT).show()
-                }
-
+                Log.d(TAG, "Waiting for incoming connection...")
                 val sock = serverSocket.accept()
                 socket = sock
                 socket.tcpNoDelay = true
@@ -413,24 +519,93 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val screenHeight = displayMetrics.heightPixels
                 Log.d(TAG, "Host connected successfully! Screen size: ${screenWidth}x${screenHeight}")
 
-                // Send screen size to host immediately
-                try {
-                    val outputStream = socket.getOutputStream()
-                    val sizeBuffer = java.nio.ByteBuffer.allocate(8)
-                    sizeBuffer.putInt(screenWidth)
-                    sizeBuffer.putInt(screenHeight)
-                    outputStream.write(sizeBuffer.array())
-                    outputStream.flush()
-                    Log.d(TAG, "Sent screen size to host: ${screenWidth}x${screenHeight}")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to send screen size to host", e)
-                }
-
                 inputStream = socket.getInputStream()
+                val outputStream = socket.getOutputStream()
 
-                runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Connected to host display!", Toast.LENGTH_SHORT).show()
-                    overlayView?.visibility = View.GONE
+                // JSON Handshake and Pairing
+                val handshakeBytes = readLengthPrefixedData(inputStream)
+                if (handshakeBytes == null) {
+                    throw Exception("Failed to read handshake bytes from client")
+                }
+                
+                val handshakeJson = JSONObject(String(handshakeBytes, Charsets.UTF_8))
+                val clientId = handshakeJson.optString("client_id")
+                val clientToken = handshakeJson.optString("token")
+                
+                val isLoopback = sock.inetAddress.isLoopbackAddress
+                var isPaired = false
+                var generatedToken = ""
+                
+                if (isLoopback) {
+                    Log.d(TAG, "Connection from loopback. Implicitly trusted.")
+                    isPaired = true
+                } else {
+                    val prefs = getSharedPreferences("pihu_paired_devices", Context.MODE_PRIVATE)
+                    val storedToken = prefs.getString(clientId, null)
+                    if (storedToken != null && storedToken == clientToken) {
+                        Log.d(TAG, "Client token verified successfully.")
+                        isPaired = true
+                    }
+                }
+                
+                if (!isPaired) {
+                    val randomPin = (100000 + (Math.random() * 900000).toInt()).toString()
+                    Log.d(TAG, "Pairing required. Generated PIN: $randomPin")
+                    
+                    runOnUiThread {
+                        statusText?.text = "Pairing Code: $randomPin\nEnter this code on your Mac."
+                        overlayView?.visibility = View.VISIBLE
+                    }
+                    
+                    val pairingRequiredResp = JSONObject().apply {
+                        put("status", "pairing_required")
+                    }
+                    if (!sendLengthPrefixedData(outputStream, pairingRequiredResp.toString().toByteArray(Charsets.UTF_8))) {
+                        throw Exception("Failed to send pairing required response")
+                    }
+                    
+                    val pinBytes = readLengthPrefixedData(inputStream)
+                    if (pinBytes == null) {
+                        throw Exception("Failed to read PIN request")
+                    }
+                    val pinJson = JSONObject(String(pinBytes, Charsets.UTF_8))
+                    val enteredPin = pinJson.optString("pin")
+                    
+                    if (enteredPin == randomPin) {
+                        generatedToken = UUID.randomUUID().toString()
+                        val prefs = getSharedPreferences("pihu_paired_devices", Context.MODE_PRIVATE)
+                        prefs.edit().putString(clientId, generatedToken).apply()
+                        Log.d(TAG, "Pairing successful! Generated token saved.")
+                        isPaired = true
+                    } else {
+                        Log.w(TAG, "Incorrect PIN entered: $enteredPin (Expected: $randomPin)")
+                        val failureResp = JSONObject().apply {
+                            put("status", "pairing_failed")
+                            put("reason", "Incorrect PIN")
+                        }
+                        sendLengthPrefixedData(outputStream, failureResp.toString().toByteArray(Charsets.UTF_8))
+                        throw Exception("Incorrect PIN entered")
+                    }
+                }
+                
+                if (isPaired) {
+                    val successResp = JSONObject().apply {
+                        put("status", "success")
+                        put("device_name", android.os.Build.MODEL)
+                        put("token", if (generatedToken.isNotEmpty()) generatedToken else clientToken)
+                        put("width", screenWidth)
+                        put("height", screenHeight)
+                    }
+                    if (!sendLengthPrefixedData(outputStream, successResp.toString().toByteArray(Charsets.UTF_8))) {
+                        throw Exception("Failed to send success response")
+                    }
+                    
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Connected to host display!", Toast.LENGTH_SHORT).show()
+                        overlayView?.visibility = View.GONE
+                    }
+                } else {
+                    throw Exception("Client not paired")
                 }
 
                 var frameCount = 0
@@ -499,13 +674,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 }
             } catch (e: Exception) {
                 if (isRunning) {
-                    Log.e(TAG, "Socket or ServerSocket error: ${e.message}")
+                    Log.e(TAG, "Socket error: ${e.message}")
                 }
             } finally {
                 try { inputStream?.close() } catch (e: Exception) {}
                 try { socket?.close() } catch (e: Exception) {}
-                try { serverSocket?.close() } catch (e: Exception) {}
-                serverSocket = null
                 socket = null
                 inputStream = null
                 
@@ -521,5 +694,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 try { Thread.sleep(1000) } catch (e: InterruptedException) { break }
             }
         }
+
+        // Final cleanup when thread is stopping
+        try { serverSocket?.close() } catch (e: Exception) {}
     }
 }

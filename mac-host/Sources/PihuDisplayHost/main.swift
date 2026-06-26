@@ -3,6 +3,7 @@ import ScreenCaptureKit
 import CoreMedia
 import VideoToolbox
 import CGVirtualDisplayPrivate
+import AppKit
 
 class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate {
     private let encoder: Encoder
@@ -57,241 +58,310 @@ class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-// Keep the virtual display, stream, and handler objects alive globally
+// Global references for CLI mode (needed to keep them alive on main thread)
 var activeVirtualDisplay: CGVirtualDisplay?
 var activeStream: SCStream?
 var activeStreamOutputHandler: StreamOutputHandler?
 
-// Top level execution
-setbuf(stdout, nil)
-print("[PihuDisplayHost] Starting host application...")
+func runHeadlessCLI() {
+    print("[PihuDisplayHost] Running in Headless CLI Mode...")
+    
+    // Command Line Arguments Parsing
+    var connectionMode: ConnectionMode = .auto
+    var manualHost: String? = nil
+    var pairPin: String? = nil
+    var userBitrate: Int? = nil
 
-// 1. Create the Virtual Display
-print("[PihuDisplayHost] Creating virtual display...")
-let descriptor = CGVirtualDisplayDescriptor()
-descriptor.queue = DispatchQueue(label: "com.pihu.display.virtual", qos: .userInteractive)
-descriptor.name = "Pihu Display"
-descriptor.sizeInMillimeters = CGSize(width: 330, height: 206) // 15" physical layout
-descriptor.maxPixelsWide = 1920
-descriptor.maxPixelsHigh = 1080
-descriptor.vendorID = 0x1234
-descriptor.productID = 0x5678
-descriptor.serialNum = 1
-
-let settings = CGVirtualDisplaySettings()
-let mode = CGVirtualDisplayMode(width: 1920, height: 1080, refreshRate: 60)!
-settings.modes = [mode]
-settings.hiDPI = 1 // 1x scaling to maximize low latency and streaming speed
-
-guard let virtualDisplay = CGVirtualDisplay(descriptor: descriptor) else {
-    print("[PihuDisplayHost] Error: Failed to create virtual display. Make sure you run with appropriate permissions.")
-    exit(1)
-}
-
-if !virtualDisplay.applySettings(settings) {
-    print("[PihuDisplayHost] WARNING: Failed to apply settings to virtual display.")
-}
-
-activeVirtualDisplay = virtualDisplay
-let virtualDisplayID = virtualDisplay.displayID
-print("[PihuDisplayHost] Successfully created Virtual Display with ID: \(virtualDisplayID)")
-
-// 2. Start the TCP Client
-let port: UInt16 = 27183
-let client = TCPClient(port: port)
-client.start()
-
-var encodedCount = 0
-let encoder = Encoder { data in
-    encodedCount += 1
-    if encodedCount % 60 == 0 {
-        print("[Encoder] Encoded & sent 60 frames (last size: \(data.count) bytes)")
-    }
-    var length = UInt32(data.count).bigEndian
-    let lengthData = Data(bytes: &length, count: 4)
-    client.send(data: lengthData)
-    client.send(data: data)
-}
-
-let handler = StreamOutputHandler(encoder: encoder)
-
-// We run the capture logic in a Task to allow top-level concurrency
-let semaphore = DispatchSemaphore(value: 0)
-
-Task {
-    do {
-        // Check for screen recording permission first
-        let hasPermission = CGRequestScreenCaptureAccess()
-        if !hasPermission {
-            print("[PihuDisplayHost] WARNING: Screen recording permission is not granted.")
-            print("[PihuDisplayHost] Please grant screen recording permission in System Settings -> Privacy & Security -> Screen & System Audio Recording.")
-        }
-        
-        // 3. Fetch shareable content
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-        
-        // 4. Find our virtual display specifically
-        guard let display = content.displays.first(where: { $0.displayID == virtualDisplayID }) else {
-            print("[PihuDisplayHost] Error: Virtual display ID \(virtualDisplayID) not found in ScreenCaptureKit.")
-            semaphore.signal()
-            return
-        }
-        
-        print("[PihuDisplayHost] Capturing virtual display: \(display.width)x\(display.height)")
-        
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        
-        // 5. Configure capture stream settings
-        let config = SCStreamConfiguration()
-        config.width = display.width
-        config.height = display.height
-        
-        // Set 60 FPS
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        
-        // Use YUV420 pixel format for hardware compression optimization
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        
-        // Keep queue depth small to minimize latency
-        config.queueDepth = 3
-        
-        // 6. Create and start stream
-        let stream = SCStream(filter: filter, configuration: config, delegate: handler)
-        try stream.addStreamOutput(handler, type: SCStreamOutputType.screen, sampleHandlerQueue: DispatchQueue(label: "com.pihu.display.capture"))
-        
-        try await stream.startCapture()
-        activeStream = stream
-        activeStreamOutputHandler = handler
-        print("[PihuDisplayHost] Screen capture of virtual display started successfully!")
-        print("[PihuDisplayHost] You can configure mirroring or extension in System Settings -> Displays.")
-        print("[PihuDisplayHost] Press Ctrl+C to stop.")
-        
-    } catch {
-        print("[PihuDisplayHost] Error starting screen capture: \(error.localizedDescription)")
-        semaphore.signal()
-    }
-}
-
-// Block main thread to keep process alive until terminated
-let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: DispatchQueue.main)
-sigintSource.setEventHandler {
-    print("\n[PihuDisplayHost] Shutting down...")
-    if let stream = activeStream {
-        Task {
-            try? await stream.stopCapture()
+    let args = CommandLine.arguments
+    var argIdx = 1
+    while argIdx < args.count {
+        let arg = args[argIdx]
+        if arg == "--mode" && argIdx + 1 < args.count {
+            let val = args[argIdx+1].lowercased()
+            if val == "usb" {
+                connectionMode = .usb
+            } else if val == "wifi" {
+                connectionMode = .wifi
+            } else {
+                connectionMode = .auto
+            }
+            argIdx += 2
+        } else if arg == "--host" && argIdx + 1 < args.count {
+            manualHost = args[argIdx+1]
+            argIdx += 2
+        } else if arg == "--pair" && argIdx + 1 < args.count {
+            pairPin = args[argIdx+1]
+            argIdx += 2
+        } else if arg == "--bitrate" && argIdx + 1 < args.count {
+            if let val = Int(args[argIdx+1]) {
+                userBitrate = val
+            }
+            argIdx += 2
+        } else {
+            argIdx += 1
         }
     }
-    client.stop()
-    encoder.teardownSession()
-    activeStream = nil
-    activeStreamOutputHandler = nil
-    activeVirtualDisplay = nil // Destroy virtual display
-    exit(0)
-}
-signal(SIGINT, SIG_IGN)
-sigintSource.resume()
 
-// 7. Dynamic Resolution Updater based on client aspect ratio
-func updateVirtualDisplayResolution(phoneWidth: UInt32, phoneHeight: UInt32) {
-    guard let virtualDisplay = activeVirtualDisplay else { return }
-    
-    // Calculate aspect ratio
-    let aspect = Double(phoneWidth) / Double(phoneHeight)
-    
-    // Fit the phone aspect ratio within the 1920x1080 maximum bounds
-    let finalWidth: Int32
-    let finalHeight: Int32
-    
-    let maxW: Double = 1920.0
-    let maxH: Double = 1080.0
-    
-    if aspect > (maxW / maxH) {
-        // Phone is wider than 16:9
-        let w = maxW
-        let h = w / aspect
-        let wInt = Int32(round(w))
-        let hInt = Int32(round(h))
-        finalWidth = (wInt % 2 == 0) ? wInt : wInt - 1
-        finalHeight = (hInt % 2 == 0) ? hInt : hInt - 1
-    } else {
-        // Phone is taller than 16:9 (e.g. 16:10 or 4:3)
-        let h = maxH
-        let w = h * aspect
-        let wInt = Int32(round(w))
-        let hInt = Int32(round(h))
-        finalWidth = (wInt % 2 == 0) ? wInt : wInt - 1
-        finalHeight = (hInt % 2 == 0) ? hInt : hInt - 1
+    // 1. Resolve Target IP Address
+    guard let targetHost = NetworkDiscovery.resolveAddress(mode: connectionMode, manualHost: manualHost) else {
+        print("[PihuDisplayHost] Error: Could not resolve target device address. Please ensure a device is connected via USB (for USB mode) or is reachable on the local Wi-Fi/Hotspot network (for Wi-Fi mode).")
+        exit(1)
     }
-    
-    print("[PihuDisplayHost] Updating virtual display resolution to match phone aspect ratio: \(finalWidth)x\(finalHeight) (Phone: \(phoneWidth)x\(phoneHeight))")
-    
+
+    let isWifi = (targetHost != "127.0.0.1")
+    let selectedBitrate = userBitrate ?? (isWifi ? 5_000_000 : 8_000_000)
+    print("[PihuDisplayHost] Target IP: \(targetHost), Selected Bitrate: \(selectedBitrate) bps")
+
+    // 2. Create the Virtual Display
+    print("[PihuDisplayHost] Creating virtual display...")
+    let descriptor = CGVirtualDisplayDescriptor()
+    descriptor.queue = DispatchQueue(label: "com.pihu.display.virtual", qos: .userInteractive)
+    descriptor.name = "Pihu Display"
+    descriptor.sizeInMillimeters = CGSize(width: 330, height: 206) // 15" physical layout
+    descriptor.maxPixelsWide = 1920
+    descriptor.maxPixelsHigh = 1080
+    descriptor.vendorID = 0x1234
+    descriptor.productID = 0x5678
+    descriptor.serialNum = 1
+
     let settings = CGVirtualDisplaySettings()
-    guard let mode = CGVirtualDisplayMode(width: UInt32(finalWidth), height: UInt32(finalHeight), refreshRate: 60) else {
-        print("[PihuDisplayHost] Error: Failed to create CGVirtualDisplayMode for \(finalWidth)x\(finalHeight)")
-        return
-    }
+    let mode = CGVirtualDisplayMode(width: 1920, height: 1080, refreshRate: 60)!
     settings.modes = [mode]
-    settings.hiDPI = 1
-    
-    if virtualDisplay.applySettings(settings) {
-        print("[PihuDisplayHost] Successfully applied new display resolution settings.")
-        
-        // Restart capture stream to pick up the new resolution
-        Task {
-            if let stream = activeStream {
-                do {
-                    try await stream.stopCapture()
-                    print("[PihuDisplayHost] Stopped old capture stream.")
-                } catch {
-                    print("[PihuDisplayHost] Error stopping capture stream: \(error)")
-                }
-            }
-            
-            // Re-create the stream configuration with new dimensions
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-                guard let display = content.displays.first(where: { $0.displayID == virtualDisplay.displayID }) else {
-                    print("[PihuDisplayHost] Error: Virtual display not found for recreation.")
-                    return
-                }
-                
-                print("[PihuDisplayHost] Re-capturing virtual display: \(display.width)x\(display.height)")
-                
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                config.width = display.width
-                config.height = display.height
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-                config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-                config.queueDepth = 3
-                
-                let handler = StreamOutputHandler(encoder: encoder)
-                let stream = SCStream(filter: filter, configuration: config, delegate: handler)
-                try stream.addStreamOutput(handler, type: SCStreamOutputType.screen, sampleHandlerQueue: DispatchQueue(label: "com.pihu.display.capture"))
-                
-                try await stream.startCapture()
-                activeStream = stream
-                activeStreamOutputHandler = handler
-                print("[PihuDisplayHost] Screen capture restarted successfully at \(display.width)x\(display.height)!")
-            } catch {
-                print("[PihuDisplayHost] Error restarting screen capture: \(error)")
-            }
-        }
-    } else {
+    settings.hiDPI = 1 // 1x scaling to maximize low latency and streaming speed
+
+    guard let virtualDisplay = CGVirtualDisplay(descriptor: descriptor) else {
+        print("[PihuDisplayHost] Error: Failed to create virtual display. Make sure you run with appropriate permissions.")
+        exit(1)
+    }
+
+    if !virtualDisplay.applySettings(settings) {
         print("[PihuDisplayHost] WARNING: Failed to apply settings to virtual display.")
     }
+
+    activeVirtualDisplay = virtualDisplay
+    let virtualDisplayID = virtualDisplay.displayID
+    print("[PihuDisplayHost] Successfully created Virtual Display with ID: \(virtualDisplayID)")
+
+    // 3. Start the TCP Client
+    let port: UInt16 = 27183
+    let client = TCPClient(host: targetHost, port: port, pairPin: pairPin)
+    client.start()
+
+    var encodedCount = 0
+    let encoder = Encoder(bitrate: selectedBitrate) { data in
+        encodedCount += 1
+        if encodedCount % 60 == 0 {
+            print("[Encoder] Encoded & sent 60 frames (last size: \(data.count) bytes)")
+        }
+        var length = UInt32(data.count).bigEndian
+        let lengthData = Data(bytes: &length, count: 4)
+        client.send(data: lengthData)
+        client.send(data: data)
+    }
+
+    let handler = StreamOutputHandler(encoder: encoder)
+
+    // We run the capture logic in a Task to allow top-level concurrency
+    let semaphore = DispatchSemaphore(value: 0)
+
+    Task {
+        do {
+            // Check for screen recording permission first
+            let hasPermission = CGRequestScreenCaptureAccess()
+            if !hasPermission {
+                print("[PihuDisplayHost] WARNING: Screen recording permission is not granted.")
+                print("[PihuDisplayHost] Please grant screen recording permission in System Settings -> Privacy & Security -> Screen & System Audio Recording.")
+            }
+            
+            // 3. Fetch shareable content
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            
+            // 4. Find our virtual display specifically
+            guard let display = content.displays.first(where: { $0.displayID == virtualDisplayID }) else {
+                print("[PihuDisplayHost] Error: Virtual display ID \(virtualDisplayID) not found in ScreenCaptureKit.")
+                semaphore.signal()
+                return
+            }
+            
+            print("[PihuDisplayHost] Capturing virtual display: \(display.width)x\(display.height)")
+            
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            
+            // 5. Configure capture stream settings
+            let config = SCStreamConfiguration()
+            config.width = display.width
+            config.height = display.height
+            
+            // Set 60 FPS
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            
+            // Use YUV420 pixel format for hardware compression optimization
+            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            
+            // Keep queue depth small to minimize latency
+            config.queueDepth = 3
+            
+            // 6. Create and start stream
+            let stream = SCStream(filter: filter, configuration: config, delegate: handler)
+            try stream.addStreamOutput(handler, type: SCStreamOutputType.screen, sampleHandlerQueue: DispatchQueue(label: "com.pihu.display.capture"))
+            
+            try await stream.startCapture()
+            activeStream = stream
+            activeStreamOutputHandler = handler
+            print("[PihuDisplayHost] Screen capture of virtual display started successfully!")
+            print("[PihuDisplayHost] You can configure mirroring or extension in System Settings -> Displays.")
+            print("[PihuDisplayHost] Press Ctrl+C to stop.")
+            
+        } catch {
+            print("[PihuDisplayHost] Error starting screen capture: \(error.localizedDescription)")
+            semaphore.signal()
+        }
+    }
+
+    // Block main thread to keep process alive until terminated
+    let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: DispatchQueue.main)
+    sigintSource.setEventHandler {
+        print("\n[PihuDisplayHost] Shutting down...")
+        if let stream = activeStream {
+            Task {
+                try? await stream.stopCapture()
+            }
+        }
+        client.stop()
+        encoder.teardownSession()
+        activeStream = nil
+        activeStreamOutputHandler = nil
+        activeVirtualDisplay = nil // Destroy virtual display
+        exit(0)
+    }
+    signal(SIGINT, SIG_IGN)
+    sigintSource.resume()
+
+    // 7. Dynamic Resolution Updater based on client aspect ratio
+    func updateVirtualDisplayResolution(phoneWidth: UInt32, phoneHeight: UInt32) {
+        guard let virtualDisplay = activeVirtualDisplay else { return }
+        
+        // Calculate aspect ratio
+        let aspect = Double(phoneWidth) / Double(phoneHeight)
+        
+        // Fit the phone aspect ratio within the 1920x1080 maximum bounds
+        let finalWidth: Int32
+        let finalHeight: Int32
+        
+        let maxW: Double = 1920.0
+        let maxH: Double = 1080.0
+        
+        if aspect > (maxW / maxH) {
+            // Phone is wider than 16:9
+            let w = maxW
+            let h = w / aspect
+            let wInt = Int32(round(w))
+            let hInt = Int32(round(h))
+            finalWidth = (wInt % 2 == 0) ? wInt : wInt - 1
+            finalHeight = (hInt % 2 == 0) ? hInt : hInt - 1
+        } else {
+            // Phone is taller than 16:9 (e.g. 16:10 or 4:3)
+            let h = maxH
+            let w = h * aspect
+            let wInt = Int32(round(w))
+            let hInt = Int32(round(h))
+            finalWidth = (wInt % 2 == 0) ? wInt : wInt - 1
+            finalHeight = (hInt % 2 == 0) ? hInt : hInt - 1
+        }
+        
+        print("[PihuDisplayHost] Updating virtual display resolution to match phone aspect ratio: \(finalWidth)x\(finalHeight) (Phone: \(phoneWidth)x\(phoneHeight))")
+        
+        let settings = CGVirtualDisplaySettings()
+        guard let mode = CGVirtualDisplayMode(width: UInt32(finalWidth), height: UInt32(finalHeight), refreshRate: 60) else {
+            print("[PihuDisplayHost] Error: Failed to create CGVirtualDisplayMode for \(finalWidth)x\(finalHeight)")
+            return
+        }
+        settings.modes = [mode]
+        settings.hiDPI = 1
+        
+        if virtualDisplay.applySettings(settings) {
+            print("[PihuDisplayHost] Successfully applied new display resolution settings.")
+            
+            // Restart capture stream to pick up the new resolution
+            Task {
+                if let stream = activeStream {
+                    do {
+                        try await stream.stopCapture()
+                        print("[PihuDisplayHost] Stopped old capture stream.")
+                    } catch {
+                        print("[PihuDisplayHost] Error stopping capture stream: \(error)")
+                    }
+                }
+                
+                // Re-create the stream configuration with new dimensions
+                do {
+                    let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                    guard let display = content.displays.first(where: { $0.displayID == virtualDisplay.displayID }) else {
+                        print("[PihuDisplayHost] Error: Virtual display not found for recreation.")
+                        return
+                    }
+                    
+                    print("[PihuDisplayHost] Re-capturing virtual display: \(display.width)x\(display.height)")
+                    
+                    let filter = SCContentFilter(display: display, excludingWindows: [])
+                    let config = SCStreamConfiguration()
+                    config.width = display.width
+                    config.height = display.height
+                    config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+                    config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                    config.queueDepth = 3
+                    
+                    let handler = StreamOutputHandler(encoder: encoder)
+                    let stream = SCStream(filter: filter, configuration: config, delegate: handler)
+                    try stream.addStreamOutput(handler, type: SCStreamOutputType.screen, sampleHandlerQueue: DispatchQueue(label: "com.pihu.display.capture"))
+                    
+                    try await stream.startCapture()
+                    activeStream = stream
+                    activeStreamOutputHandler = handler
+                    print("[PihuDisplayHost] Screen capture restarted successfully at \(display.width)x\(display.height)!")
+                } catch {
+                    print("[PihuDisplayHost] Error restarting screen capture: \(error)")
+                }
+            }
+        } else {
+            print("[PihuDisplayHost] WARNING: Failed to apply settings to virtual display.")
+        }
+    }
+
+    NotificationCenter.default.addObserver(
+        forName: Notification.Name("PihuAndroidScreenSizeReceived"),
+        object: nil,
+        queue: .main
+    ) { notification in
+        guard let userInfo = notification.userInfo,
+              let phoneWidth = userInfo["width"] as? UInt32,
+              let phoneHeight = userInfo["height"] as? UInt32 else { return }
+        
+        updateVirtualDisplayResolution(phoneWidth: phoneWidth, phoneHeight: phoneHeight)
+    }
+
+    semaphore.wait()
 }
 
-NotificationCenter.default.addObserver(
-    forName: Notification.Name("PihuAndroidScreenSizeReceived"),
-    object: nil,
-    queue: .main
-) { notification in
-    guard let userInfo = notification.userInfo,
-          let phoneWidth = userInfo["width"] as? UInt32,
-          let phoneHeight = userInfo["height"] as? UInt32 else { return }
-    
-    updateVirtualDisplayResolution(phoneWidth: phoneWidth, phoneHeight: phoneHeight)
+// Start execution
+setbuf(stdout, nil)
+
+// Check mode: GUI mode if no args or if --gui is present
+var isGuiMode = true
+let commandArgs = CommandLine.arguments
+if commandArgs.count > 1 {
+    if !commandArgs.contains("--gui") {
+        isGuiMode = false
+    }
 }
 
-semaphore.wait()
+if isGuiMode {
+    print("[PihuDisplayHost] Starting Pihu Display Menu Bar GUI...")
+    let app = NSApplication.shared
+    let delegate = MenuController()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+} else {
+    runHeadlessCLI()
+}

@@ -5,8 +5,10 @@ import CoreMedia
 class Encoder {
     private var compressionSession: VTCompressionSession?
     private let onEncodedFrame: (Data) -> Void
+    private let bitrate: Int
     
-    init(onEncodedFrame: @escaping (Data) -> Void) {
+    init(bitrate: Int = 8_000_000, onEncodedFrame: @escaping (Data) -> Void) {
+        self.bitrate = bitrate
         self.onEncodedFrame = onEncodedFrame
     }
     
@@ -47,7 +49,7 @@ class Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber) // Disable B-frames
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 8_000_000 as CFNumber) // 8 Mbps
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         
         // Insert a keyframe every 60 frames (1 second at 60 FPS) to ensure quick recovery on reconnect
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFNumber)
